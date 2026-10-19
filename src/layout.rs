@@ -1,4 +1,4 @@
-//! The crate's trusted bridge to `core::alloc::Layout`.
+//! The crate's trusted bridge to `core::alloc::Layout::{size, align}`.
 
 use core::alloc::Layout;
 #[cfg(verus_only)]
@@ -10,10 +10,6 @@ verus! {
 #[verifier::external_type_specification]
 #[verifier::external_body]
 pub struct ExLayout(Layout);
-
-#[verifier::external_type_specification]
-#[verifier::external_body]
-pub struct ExLayoutError(core::alloc::LayoutError);
 
 pub uninterp spec fn layout_size(l: &Layout) -> usize;
 pub uninterp spec fn layout_align(l: &Layout) -> usize;
@@ -28,17 +24,6 @@ pub assume_specification [Layout::size](l: &Layout) -> (s: usize)
 #[verifier::when_used_as_spec(layout_align)]
 pub assume_specification [Layout::align](l: &Layout) -> (a: usize)
     ensures a == layout_align(l), exists|n: nat| n < usize::BITS && a == pow2(n),
-    opens_invariants none
-    no_unwind;
-
-pub assume_specification<T> [Layout::new::<T>]() -> (l: Layout)
-    ensures layout_size(&l) == size_of::<T>(), layout_align(&l) == align_of::<T>(),
-    opens_invariants none
-    no_unwind;
-
-pub assume_specification<T> [Layout::array::<T>](n: usize) -> (r: Result<Layout, core::alloc::LayoutError>)
-    ensures r matches Ok(l) ==> layout_size(&l) == n * size_of::<T>()
-        && layout_align(&l) == align_of::<T>() && layout_size(&l) <= isize::MAX,
     opens_invariants none
     no_unwind;
 

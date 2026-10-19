@@ -1,4 +1,4 @@
-use verus_bumpalo::{SliceArena, TypedArena};
+use verus_bumpalo::{AllocErr, SliceArena, TypedArena};
 
 #[test]
 fn arena_round_trips() {
@@ -29,13 +29,19 @@ fn arena_round_trips() {
 
 #[test]
 fn allocation_failure_preserves_contents() {
-    assert!(TypedArena::<u64>::with_capacity(0).is_err());
-    assert!(TypedArena::<u64>::with_capacity(usize::MAX).is_err());
+    assert_eq!(
+        TypedArena::<u64>::with_capacity(0).err(),
+        Some(AllocErr::Capacity)
+    );
+    assert_eq!(
+        TypedArena::<u64>::with_capacity(usize::MAX).err(),
+        Some(AllocErr::Capacity)
+    );
     let mut values = TypedArena::with_capacity(64).unwrap();
     for index in 0..8 {
         assert_eq!(values.try_push(index as u64), Ok(index));
     }
-    assert!(values.try_push(99).is_err());
+    assert_eq!(values.try_push(99), Err(AllocErr::Exhausted));
     assert_eq!(values.len(), 8);
     for index in 0..8 {
         assert_eq!(values.get(index), Some(&(index as u64)));
@@ -45,11 +51,17 @@ fn allocation_failure_preserves_contents() {
     let mut slices = SliceArena::with_capacity(64).unwrap();
     assert_eq!(slices.try_push(&[1u64, 2, 3]), Ok(0));
     assert_eq!(slices.try_push(&[4, 5, 6]), Ok(1));
-    assert!(slices.try_push(&[7, 8, 9]).is_err());
+    assert_eq!(slices.try_push(&[7, 8, 9]), Err(AllocErr::Exhausted));
     assert_eq!(slices.len(), 2);
     assert_eq!(slices.get(0), Some(&[1, 2, 3][..]));
     assert_eq!(slices.get(1), Some(&[4, 5, 6][..]));
     slices.free();
+
+    // Aligned cursor, first push already too large: exhausted exactly when w > remaining.
+    let mut wide = TypedArena::<[u8; 32]>::with_capacity(16).unwrap();
+    assert_eq!(wide.try_push([0; 32]), Err(AllocErr::Exhausted));
+    assert_eq!(wide.len(), 0);
+    wide.free();
 }
 
 #[test]

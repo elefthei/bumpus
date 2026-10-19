@@ -9,13 +9,15 @@
 //!
 //! Memory-safety guarantees require verified callers to preserve tracked permissions;
 //! ordinary Rust raw-pointer dereferences still require `unsafe`. Trusted boundaries
-//! are the `core::alloc::Layout` bridge, fallible chunk allocation, and slice formation.
+//! are `Layout::size`/`Layout::align`, fallible chunk allocation, and slice formation.
 
 extern crate alloc;
 
 use core::alloc::Layout;
 #[cfg(verus_only)]
 use vstd::arithmetic::power2::{is_pow2, pow2};
+#[cfg(verus_only)]
+use vstd::arithmetic::power::pow;
 use vstd::cell::pcell::{PCell, PointsTo as CellPointsTo};
 use vstd::prelude::*;
 use vstd::raw_ptr::{
@@ -30,14 +32,19 @@ pub mod layout;
 pub use arena::{SliceArena, SlicePerm, TypedArena};
 
 verus! {
-global layout u64 is size == 8, align == 8;
-
-
 pub const CHUNK_ALIGN: usize = 16;
 pub const MAX_CAP: usize = (isize::MAX as usize) - 15;
 
+/// Why an allocation request was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AllocErr;
+pub enum AllocErr {
+    /// The request does not fit in this chunk (including a byte count that overflows `usize`).
+    Exhausted,
+    /// The global allocator failed (chunk creation or the containers' pointer table).
+    Global,
+    /// `cap == 0 || cap > MAX_CAP`.
+    Capacity,
+}
 
 /// Trusted: fallible global allocation. A null result becomes `None`; no abort.
 #[verifier::external_body]
@@ -128,6 +135,8 @@ impl Bump {
     pub closed spec fn wf(self, st: BumpState) -> bool {
         &&& st.ptr_perm.id() == self.ptr.id()
         &&& self.start != 0
+        &&& self.start as int % CHUNK_ALIGN as int == 0
+        &&& self.end - self.start <= MAX_CAP
         &&& self.start <= *st.ptr_perm.value() <= self.end
         &&& st.exposed.provenance() == st.free.provenance()
         &&& st.dealloc.provenance() == st.free.provenance()
@@ -141,22 +150,34 @@ impl Bump {
             ==> range_of(st.auth@[k]).disjoint(used_upto(st.auth@, k))
     }
 
-    /// Creates one fixed-size chunk, returning `AllocErr` on global allocation failure.
+    /// Bounds every well-formed arena satisfies.
+    pub proof fn lemma_wf(self, st: BumpState)
+        requires self.wf(st),
+        ensures
+            0 <= self.remaining(st) <= self.capacity() <= MAX_CAP,
+            self.start() != 0,
+            self.start() as int % CHUNK_ALIGN as int == 0,
+    {
+    }
+
+    /// Creates one fixed-size chunk.
     ///
     /// # Errors
-    /// Returns `AllocErr` for zero/oversized capacity or an unrepresentable end address.
+    /// `Capacity` for zero/oversized capacity; `Global` when the global allocator fails
+    /// or the chunk's end address is unrepresentable.
     pub fn try_with_capacity(cap: usize) -> (r: Result<(Bump, Tracked<BumpState>), AllocErr>)
         ensures
             r matches Ok((b, st)) ==> b.wf(st@) && st@.outstanding().is_empty()
                 && b.capacity() == cap && b.remaining(st@) == cap,
+            cap == 0 || cap > MAX_CAP ==> r == Err(AllocErr::Capacity),
     {
-        if cap == 0 || cap > MAX_CAP { return Err(AllocErr); }
+        if cap == 0 || cap > MAX_CAP { return Err(AllocErr::Capacity); }
         proof {
             reveal(is_pow2);
             assert(is_pow2(16)) by (compute);
         }
         let Some((base, Tracked(free), Tracked(dealloc))) = try_allocate(cap, CHUNK_ALIGN)
-            else { return Err(AllocErr); };
+            else { return Err(AllocErr::Global); };
         let start = base.addr();
         if start > usize::MAX - cap {
             proof {
@@ -164,7 +185,7 @@ impl Bump {
                 assert((usize::MAX as int + 1) % 16 == 0);
             }
             deallocate(base, cap, CHUNK_ALIGN, Tracked(free), Tracked(dealloc));
-            return Err(AllocErr);
+            return Err(AllocErr::Global);
         }
         let end = start + cap;
         let Tracked(exposed) = expose_provenance(base);
@@ -178,15 +199,16 @@ impl Bump {
         Ok((Bump { ptr, start, end }, Tracked(st)))
     }
 
-    /// Allocates downward from this arena, retaining padding for later reclamation.
-    /// Returns the pointer, its uninitialized-memory permission, and its return token.
+    /// Allocates `size` bytes at power-of-two `align` downward from this arena, retaining
+    /// padding for later reclamation. Returns the pointer, its uninitialized-memory
+    /// permission, and its return token.
     ///
     /// # Errors
-    /// Returns `AllocErr` without changing the arena if size or alignment exhausts it.
+    /// Returns `Exhausted` without changing the arena if size or alignment exhausts it.
     #[inline(always)]
-    pub fn try_alloc_layout(&self, layout: Layout, Tracked(st): Tracked<&mut BumpState>)
+    pub fn try_alloc(&self, size: usize, align: usize, Tracked(st): Tracked<&mut BumpState>)
         -> (r: Result<(*mut u8, Tracked<PointsToRaw>, Tracked<BumpTok>), AllocErr>)
-        requires self.wf(*old(st)),
+        requires self.wf(*old(st)), exists|n: nat| n < usize::BITS && align == pow2(n),
         ensures
             self.wf(*final(st)),
             final(st).inst() == old(st).inst(),
@@ -194,34 +216,32 @@ impl Bump {
             self.remaining(*final(st)) <= self.remaining(*old(st)),
             r matches Ok((p, perm, tok)) ==> {
                 &&& p.addr() != 0
-                &&& perm@.is_range(p.addr() as int, layout.size() as int)
+                &&& perm@.is_range(p.addr() as int, size as int)
                 &&& perm@.provenance() == p@.provenance
                 &&& perm@.provenance() == final(st).provenance()
-                &&& p.addr() as int % layout.align() as int == 0
-                &&& self.in_arena(p.addr(), layout.size())
-                &&& p.addr() == align_down(self.cursor(*old(st)) - layout.size(), layout.align() as int)
+                &&& p.addr() as int % align as int == 0
+                &&& self.in_arena(p.addr(), size)
+                &&& p.addr() == align_down(self.cursor(*old(st)) - size, align as int)
                 &&& self.cursor(*final(st)) == p.addr()
                 &&& tok@.inst() == final(st).inst()
-                &&& tok@.alloc() == Alloc { addr: p.addr(), size: layout.size() }
+                &&& tok@.alloc() == Alloc { addr: p.addr(), size }
                 &&& !old(st).outstanding().contains(tok@.id())
                 &&& final(st).outstanding() == old(st).outstanding().insert(tok@.id())
             },
-            r is Err ==> *final(st) == *old(st),
-            r is Ok <==> layout.size() <= self.remaining(*old(st))
-                && self.start() <= align_down(self.cursor(*old(st)) - layout.size(), layout.align() as int),
-            layout.size() + layout.align() - 1 <= self.remaining(*old(st)) ==> r is Ok,
+            r is Err ==> *final(st) == *old(st) && r == Err(AllocErr::Exhausted),
+            r is Ok <==> size <= self.remaining(*old(st))
+                && self.start() <= align_down(self.cursor(*old(st)) - size, align as int),
+            size + align - 1 <= self.remaining(*old(st)) ==> r is Ok,
     {
-        let size = layout.size();
-        let align = layout.align();
         let ghost n = choose|n: nat| n < usize::BITS && align == pow2(n);
         proof { vstd::bits::lemma_usize_pow2_no_overflow(n); }
         let ptr = self.ptr.read(Tracked(&st.ptr_perm));
-        if size > ptr - self.start { return Err(AllocErr); }
+        if size > ptr - self.start { return Err(AllocErr::Exhausted); }
         proof {
             lemma_align_down((ptr - size) as usize, align, n);
         }
         let new = (ptr - size) & !(align - 1);
-        if new < self.start { return Err(AllocErr); }
+        if new < self.start { return Err(AllocErr::Exhausted); }
         let ghost m = st.auth@;
         let ghost id = st.next_id;
         proof { assert(!st.auth.dom().contains(id)); }
@@ -257,6 +277,41 @@ impl Bump {
             assert(Set::range(self.start as int, new as int) <= st.free.dom());
         }
         Ok((p, Tracked(perm), Tracked(BumpTok { pt })))
+    }
+
+    /// `try_alloc` with `layout.size()` and `layout.align()`.
+    ///
+    /// # Errors
+    /// Returns `Exhausted` without changing the arena if size or alignment exhausts it.
+    #[inline(always)]
+    pub fn try_alloc_layout(&self, layout: Layout, Tracked(st): Tracked<&mut BumpState>)
+        -> (r: Result<(*mut u8, Tracked<PointsToRaw>, Tracked<BumpTok>), AllocErr>)
+        requires self.wf(*old(st)),
+        ensures
+            self.wf(*final(st)),
+            final(st).inst() == old(st).inst(),
+            final(st).provenance() == old(st).provenance(),
+            self.remaining(*final(st)) <= self.remaining(*old(st)),
+            r matches Ok((p, perm, tok)) ==> {
+                &&& p.addr() != 0
+                &&& perm@.is_range(p.addr() as int, layout.size() as int)
+                &&& perm@.provenance() == p@.provenance
+                &&& perm@.provenance() == final(st).provenance()
+                &&& p.addr() as int % layout.align() as int == 0
+                &&& self.in_arena(p.addr(), layout.size())
+                &&& p.addr() == align_down(self.cursor(*old(st)) - layout.size(), layout.align() as int)
+                &&& self.cursor(*final(st)) == p.addr()
+                &&& tok@.inst() == final(st).inst()
+                &&& tok@.alloc() == Alloc { addr: p.addr(), size: layout.size() }
+                &&& !old(st).outstanding().contains(tok@.id())
+                &&& final(st).outstanding() == old(st).outstanding().insert(tok@.id())
+            },
+            r is Err ==> *final(st) == *old(st) && r == Err(AllocErr::Exhausted),
+            r is Ok <==> layout.size() <= self.remaining(*old(st))
+                && self.start() <= align_down(self.cursor(*old(st)) - layout.size(), layout.align() as int),
+            layout.size() + layout.align() - 1 <= self.remaining(*old(st)) ==> r is Ok,
+    {
+        self.try_alloc(layout.size(), layout.align(), Tracked(st))
     }
 }
 
@@ -311,6 +366,62 @@ proof fn lemma_align_down(x: usize, a: usize, n: nat)
     assert((x & !m) + (x & m) == x) by (bit_vector);
     vstd::arithmetic::div_mod::lemma_fundamental_div_mod(x as int, a as int);
     vstd::arithmetic::div_mod::lemma_mod_multiples_basic((x as int) / (a as int), a as int);
+}
+
+/// Every power of two is `pow2(n)` for some exponent.
+pub proof fn lemma_pow2_exponent(a: int) -> (n: nat)
+    requires is_pow2(a),
+    ensures a == pow2(n),
+{
+    broadcast use vstd::arithmetic::power2::is_pow2_equiv;
+    let n = choose|i: nat| pow(2, i) == a;
+    vstd::arithmetic::power2::lemma_pow2(n);
+    n
+}
+
+/// A power of two that fits in `usize` has an exponent below `usize::BITS`.
+pub proof fn lemma_pow2_witness(a: usize)
+    requires is_pow2(a as int),
+    ensures exists|n: nat| n < usize::BITS && a == pow2(n),
+{
+    let n = lemma_pow2_exponent(a as int);
+    if n >= usize::BITS {
+        vstd::layout::unsigned_int_max_values();
+        if n > usize::BITS {
+            vstd::arithmetic::power2::lemma_pow2_strictly_increases(usize::BITS as nat, n);
+        }
+        assert(false);
+    }
+}
+
+/// A power-of-two alignment at most `CHUNK_ALIGN` divides every `CHUNK_ALIGN`-aligned address.
+pub proof fn lemma_chunk_align_divides(x: int, a: int)
+    requires is_pow2(a), a <= CHUNK_ALIGN, x % CHUNK_ALIGN as int == 0,
+    ensures x % a == 0,
+{
+    let n = lemma_pow2_exponent(a);
+    vstd::arithmetic::power2::lemma2_to64();
+    if n > 4 {
+        vstd::arithmetic::power2::lemma_pow2_strictly_increases(4, n);
+    }
+    let k = (4 - n) as nat;
+    vstd::arithmetic::power2::lemma_pow2_adds(n, k);
+    vstd::arithmetic::power2::lemma_pow2_pos(k);
+    let b = pow2(k) as int;
+    assert(a * b == CHUNK_ALIGN);
+    vstd::arithmetic::div_mod::lemma_mod_mod(x, a, b);
+    assert((x % (a * b)) % a == x % a);
+    assert(x % (a * b) == 0);
+    vstd::arithmetic::div_mod::lemma_small_mod(0, a as nat);
+}
+
+/// Rounding `c - s` down to `a` is the identity when both terms are multiples of `a`.
+pub proof fn lemma_align_down_exact(c: int, s: int, a: int)
+    requires a > 0, c % a == 0, s % a == 0,
+    ensures align_down(c - s, a) == c - s,
+{
+    vstd::arithmetic::div_mod::lemma_small_mod(0, a as nat);
+    vstd::arithmetic::div_mod::lemma_sub_mod_noop(c, s, a);
 }
 
 /// Caller-side well-formedness of permissions returned for reclamation.
@@ -543,11 +654,12 @@ pub fn smoke() -> (r: Result<u64, AllocErr>)
 {
     let (bump, Tracked(mut st)) = Bump::try_with_capacity(4096)?;
     let mut bump = bump;
-    let layout = Layout::new::<u64>();
-    let (a, Tracked(pa), Tracked(ta)) =
-        bump.try_alloc_layout(layout, Tracked(&mut st)).unwrap();
-    let (b, Tracked(pb), Tracked(tb)) =
-        bump.try_alloc_layout(layout, Tracked(&mut st)).unwrap();
+    vstd::layout::layout_for_type_is_valid::<u64>();
+    let size = core::mem::size_of::<u64>();
+    let align = core::mem::align_of::<u64>();
+    proof { lemma_pow2_witness(align); }
+    let (a, Tracked(pa), Tracked(ta)) = bump.try_alloc(size, align, Tracked(&mut st))?;
+    let (b, Tracked(pb), Tracked(tb)) = bump.try_alloc(size, align, Tracked(&mut st))?;
     let a64 = a as *mut u64;
     let tracked mut pta = pa.into_typed::<u64>(a.addr());
     vstd::raw_ptr::ptr_mut_write(a64, Tracked(&mut pta), 42u64);
@@ -557,8 +669,7 @@ pub fn smoke() -> (r: Result<u64, AllocErr>)
         ta.agree(&st);
     }
     bump.reset_to(a.addr(), Tracked(&mut st), Tracked(back));
-    let (c, Tracked(pc), Tracked(tc)) =
-        bump.try_alloc_layout(layout, Tracked(&mut st)).unwrap();
+    let (c, Tracked(pc), Tracked(tc)) = bump.try_alloc(size, align, Tracked(&mut st))?;
     assert!(c.addr() == b.addr());
     let v = vstd::raw_ptr::ptr_mut_read(a64, Tracked(&mut pta));
     let tracked raw = pta.into_raw();
@@ -569,8 +680,7 @@ pub fn smoke() -> (r: Result<u64, AllocErr>)
         assert(back.dom() =~= st.outstanding());
     }
     bump.reset(Tracked(&mut st), Tracked(back));
-    let (d, Tracked(pd), Tracked(td)) =
-        bump.try_alloc_layout(layout, Tracked(&mut st)).unwrap();
+    let (d, Tracked(pd), Tracked(td)) = bump.try_alloc(size, align, Tracked(&mut st))?;
     assert!(d.addr() == a.addr());
     let tracked mut back_d = Map::tracked_empty();
     proof { back_d.tracked_insert(td.id(), (pd, td)); }

@@ -1,10 +1,12 @@
 //! Verified fixed-chunk containers with encapsulated allocation permissions.
 
 #[cfg(verus_only)]
-use crate::{back_wf, Alloc, Id};
+use crate::{
+    back_wf, lemma_align_down_exact, lemma_chunk_align_divides, lemma_pow2_witness, Alloc, Id,
+    CHUNK_ALIGN, MAX_CAP,
+};
 use crate::{AllocErr, Bump, BumpState, BumpTok};
 use alloc::vec::Vec;
-use core::alloc::Layout;
 #[cfg(verus_only)]
 use vstd::layout::{align_of, size_of};
 use vstd::prelude::*;
@@ -176,6 +178,12 @@ impl<T: Copy> TypedInner<T> {
         Seq::new(self.ptrs@.len(), |i: int| self.perms@[i].0.value())
     }
 
+    closed spec fn capacity(&self) -> int { self.bump.capacity() }
+    closed spec fn remaining(&self) -> int { self.bump.remaining(self.st@) }
+    closed spec fn aligned(&self) -> bool {
+        self.bump.cursor(self.st@) as int % align_of::<T>() as int == 0
+    }
+
     fn len(&self) -> (n: usize)
         requires self.wf(),
         ensures n == self.view().len(),
@@ -203,9 +211,16 @@ impl<T: Copy> TypedInner<T> {
         requires old(self).wf(),
         ensures
             final(self).wf(),
+            final(self).capacity() == old(self).capacity(),
             r matches Ok(i) ==> i == old(self).view().len()
                 && final(self).view() == old(self).view().push(value),
-            r is Err ==> final(self).view() == old(self).view(),
+            r is Err ==> final(self).view() == old(self).view()
+                && final(self).remaining() == old(self).remaining()
+                && final(self).aligned() == old(self).aligned(),
+            old(self).aligned() && r is Ok ==> final(self).aligned()
+                && final(self).remaining() == old(self).remaining() - size_of::<T>(),
+            old(self).aligned() && r == Err(AllocErr::Exhausted)
+                ==> size_of::<T>() > old(self).remaining(),
     {
         let ghost previous_ptrs = self.ptrs@;
         let ghost previous_perms = self.perms@;
@@ -215,12 +230,19 @@ impl<T: Copy> TypedInner<T> {
             assert(typed_permissions_wf(previous_perms, previous_ptrs.len(), previous_st));
         }
         if self.ptrs.try_reserve(1).is_err() {
-            return Err(AllocErr);
+            return Err(AllocErr::Global);
         }
         vstd::layout::layout_for_type_is_valid::<T>();
-        let layout = Layout::new::<T>();
-        let (p8, Tracked(raw), Tracked(tok)) = match self.bump.try_alloc_layout(
-            layout, Tracked(self.st.borrow_mut()),
+        let size = core::mem::size_of::<T>();
+        let align = core::mem::align_of::<T>();
+        proof {
+            lemma_pow2_witness(align);
+            if self.aligned() {
+                lemma_align_down_exact(self.bump.cursor(self.st@) as int, size as int, align as int);
+            }
+        }
+        let (p8, Tracked(raw), Tracked(tok)) = match self.bump.try_alloc(
+            size, align, Tracked(self.st.borrow_mut()),
         ) {
             Ok(allocation) => allocation,
             Err(error) => { return Err(error); }
@@ -342,9 +364,29 @@ impl<T: Copy> TypedArena<T> {
         self.inner is Some ==> self.inner->0.wf()
     }
 
+    /// Chunk size in bytes (0 without a chunk).
+    pub closed spec fn capacity(&self) -> int {
+        match self.inner { Some(inner) => inner.capacity(), None => 0 }
+    }
+
+    /// Bytes below the cursor (0 without a chunk).
+    pub closed spec fn remaining(&self) -> int {
+        match self.inner { Some(inner) => inner.remaining(), None => 0 }
+    }
+
+    /// The cursor is a multiple of `align_of::<T>()`, so pushes never pad.
+    pub closed spec fn aligned(&self) -> bool {
+        self.inner matches Some(inner) ==> inner.aligned()
+    }
+
     /// Creates an empty arena backed by one fixed-size chunk.
     pub fn with_capacity(capacity: usize) -> (r: Result<Self, AllocErr>)
-        ensures r matches Ok(arena) ==> arena@ == Seq::<T>::empty(),
+        ensures
+            r matches Ok(arena) ==> arena@ == Seq::<T>::empty()
+                && arena.capacity() == capacity && arena.remaining() == capacity
+                && (align_of::<T>() <= CHUNK_ALIGN
+                    && capacity as int % align_of::<T>() as int == 0 ==> arena.aligned()),
+            capacity == 0 || capacity > MAX_CAP ==> r == Err(AllocErr::Capacity),
     {
         let (bump, Tracked(st)) = Bump::try_with_capacity(capacity)?;
         let ptrs = Vec::new();
@@ -352,6 +394,7 @@ impl<T: Copy> TypedArena<T> {
         proof {
             assert(typed_token_ids::<T>(perms, 0) =~= Set::empty());
             assert(perms.dom() =~= Set::range(0int, 0int));
+            lemma_cursor_aligned::<T>(bump, st, capacity);
         }
         Ok(TypedArena { inner: Some(TypedInner {
             bump, ptrs, st: Tracked(st), perms: Tracked(perms),
@@ -383,11 +426,21 @@ impl<T: Copy> TypedArena<T> {
     }
 
     /// Appends a copy, leaving the sequence unchanged on allocation failure.
+    ///
+    /// From an aligned cursor a push consumes exactly `size_of::<T>()` bytes and fails
+    /// with `Exhausted` only when that many bytes are not left.
     pub fn try_push(&mut self, value: T) -> (r: Result<usize, AllocErr>)
         ensures
+            final(self).capacity() == old(self).capacity(),
             r matches Ok(i) ==> i == old(self)@.len()
                 && final(self)@ == old(self)@.push(value),
-            r is Err ==> final(self)@ == old(self)@,
+            r is Err ==> final(self)@ == old(self)@
+                && final(self).remaining() == old(self).remaining()
+                && final(self).aligned() == old(self).aligned(),
+            old(self).aligned() && r is Ok ==> final(self).aligned()
+                && final(self).remaining() == old(self).remaining() - size_of::<T>(),
+            old(self).aligned() && r == Err(AllocErr::Exhausted)
+                ==> size_of::<T>() > old(self).remaining(),
     {
         proof { use_type_invariant(&*self); }
         let inner = self.inner.take();
@@ -397,7 +450,7 @@ impl<T: Copy> TypedArena<T> {
                 self.inner = Some(inner);
                 result
             }
-            None => Err(AllocErr),
+            None => Err(AllocErr::Global),
         }
     }
 
@@ -407,6 +460,25 @@ impl<T: Copy> TypedArena<T> {
         if let Some(inner) = self.inner {
             inner.free();
         }
+    }
+}
+
+/// A fresh chunk's cursor (`start + capacity`) is `T`-aligned when `T`'s alignment fits
+/// the chunk alignment and divides the capacity.
+proof fn lemma_cursor_aligned<T>(bump: Bump, st: BumpState, capacity: usize)
+    requires bump.wf(st), bump.remaining(st) == capacity,
+    ensures
+        align_of::<T>() <= CHUNK_ALIGN && capacity as int % align_of::<T>() as int == 0
+            ==> bump.cursor(st) as int % align_of::<T>() as int == 0,
+{
+    broadcast use vstd::layout::align_properties, vstd::layout::align_nonzero;
+    if align_of::<T>() <= CHUNK_ALIGN && capacity as int % align_of::<T>() as int == 0 {
+        bump.lemma_wf(st);
+        lemma_chunk_align_divides(bump.start() as int, align_of::<T>() as int);
+        vstd::arithmetic::div_mod::lemma_small_mod(0, align_of::<T>());
+        vstd::arithmetic::div_mod::lemma_add_mod_noop(
+            bump.start() as int, capacity as int, align_of::<T>() as int,
+        );
     }
 }
 
@@ -552,6 +624,12 @@ impl<T: Copy> SliceInner<T> {
         Seq::new(self.slices@.len(), |i: int| self.perms@[i].0.values())
     }
 
+    closed spec fn capacity(&self) -> int { self.bump.capacity() }
+    closed spec fn remaining(&self) -> int { self.bump.remaining(self.st@) }
+    closed spec fn aligned(&self) -> bool {
+        self.bump.cursor(self.st@) as int % align_of::<T>() as int == 0
+    }
+
     fn get(&self, index: usize) -> (r: Option<&[T]>)
         requires self.wf(),
         ensures
@@ -572,21 +650,43 @@ impl<T: Copy> SliceInner<T> {
         requires old(self).wf(),
         ensures
             final(self).wf(),
+            final(self).capacity() == old(self).capacity(),
             r matches Ok(i) ==> i == old(self).view().len()
                 && final(self).view() == old(self).view().push(values@),
-            r is Err ==> final(self).view() == old(self).view(),
+            r is Err ==> final(self).view() == old(self).view()
+                && final(self).remaining() == old(self).remaining()
+                && final(self).aligned() == old(self).aligned(),
+            old(self).aligned() && r is Ok ==> final(self).aligned()
+                && final(self).remaining() == old(self).remaining() - values@.len() * size_of::<T>(),
+            old(self).aligned() && r == Err(AllocErr::Exhausted)
+                ==> values@.len() * size_of::<T>() > old(self).remaining(),
     {
-        if self.slices.try_reserve(1).is_err() { return Err(AllocErr); }
+        if self.slices.try_reserve(1).is_err() { return Err(AllocErr::Global); }
         vstd::layout::layout_for_type_is_valid::<T>();
-        let layout = match Layout::array::<T>(values.len()) {
-            Ok(layout) => layout,
-            Err(_) => return Err(AllocErr),
+        proof { self.bump.lemma_wf(self.st@); }
+        let size = match values.len().checked_mul(core::mem::size_of::<T>()) {
+            Some(size) => size,
+            None => return Err(AllocErr::Exhausted),
         };
+        let align = core::mem::align_of::<T>();
+        proof {
+            broadcast use vstd::layout::align_nonzero;
+            lemma_pow2_witness(align);
+            vstd::arithmetic::div_mod::lemma_small_mod(0, align as nat);
+            vstd::arithmetic::div_mod::lemma_mul_mod_noop_left(
+                size_of::<T>() as int, values@.len() as int, align as int,
+            );
+            assert(size as int == values@.len() * size_of::<T>());
+            assert(size as int % align as int == 0);
+            if self.aligned() {
+                lemma_align_down_exact(self.bump.cursor(self.st@) as int, size as int, align as int);
+            }
+        }
         let ghost old_perms = self.perms@;
         let ghost old_slices = self.slices@;
         let ghost old_st = self.st@;
         let (p8, Tracked(raw), Tracked(tok)) = match
-            self.bump.try_alloc_layout(layout, Tracked(self.st.borrow_mut())) {
+            self.bump.try_alloc(size, align, Tracked(self.st.borrow_mut())) {
             Ok(a) => a,
             Err(e) => return Err(e),
         };
@@ -865,19 +965,41 @@ impl<T: Copy> SliceArena<T> {
         self.inner is Some ==> self.inner->0.wf()
     }
 
+    /// Chunk size in bytes (0 without a chunk).
+    pub closed spec fn capacity(&self) -> int {
+        match self.inner { Some(inner) => inner.capacity(), None => 0 }
+    }
+
+    /// Bytes below the cursor (0 without a chunk).
+    pub closed spec fn remaining(&self) -> int {
+        match self.inner { Some(inner) => inner.remaining(), None => 0 }
+    }
+
+    /// The cursor is a multiple of `align_of::<T>()`, so pushes never pad.
+    pub closed spec fn aligned(&self) -> bool {
+        self.inner matches Some(inner) ==> inner.aligned()
+    }
+
+    /// Creates an empty arena backed by one fixed-size chunk.
     pub fn with_capacity(capacity: usize) -> (r: Result<Self, AllocErr>)
-        ensures r matches Ok(a) ==> a@ == Seq::<Seq<T>>::empty(),
+        ensures
+            r matches Ok(a) ==> a@ == Seq::<Seq<T>>::empty()
+                && a.capacity() == capacity && a.remaining() == capacity
+                && (align_of::<T>() <= CHUNK_ALIGN
+                    && capacity as int % align_of::<T>() as int == 0 ==> a.aligned()),
+            capacity == 0 || capacity > MAX_CAP ==> r == Err(AllocErr::Capacity),
     {
-        let (bump, st) = Bump::try_with_capacity(capacity)?;
+        let (bump, Tracked(st)) = Bump::try_with_capacity(capacity)?;
         let inner = SliceInner {
             bump,
             slices: Vec::new(),
-            st,
+            st: Tracked(st),
             perms: Tracked(Map::tracked_empty()),
         };
         proof {
             assert(inner.perms@.dom() =~= Set::range(0int, 0int));
             assert(inner.wf());
+            lemma_cursor_aligned::<T>(bump, st, capacity);
         }
         Ok(Self { inner: Some(inner) })
     }
@@ -898,10 +1020,21 @@ impl<T: Copy> SliceArena<T> {
         match &self.inner { Some(inner) => inner.get(index), None => None }
     }
 
+    /// Appends a copied slice, leaving the sequence unchanged on allocation failure.
+    ///
+    /// From an aligned cursor a push consumes exactly `len * size_of::<T>()` bytes and
+    /// fails with `Exhausted` only when that many bytes are not left.
     pub fn try_push(&mut self, values: &[T]) -> (r: Result<usize, AllocErr>)
         ensures
+            final(self).capacity() == old(self).capacity(),
             r matches Ok(i) ==> i == old(self)@.len() && final(self)@ == old(self)@.push(values@),
-            r is Err ==> final(self)@ == old(self)@,
+            r is Err ==> final(self)@ == old(self)@
+                && final(self).remaining() == old(self).remaining()
+                && final(self).aligned() == old(self).aligned(),
+            old(self).aligned() && r is Ok ==> final(self).aligned()
+                && final(self).remaining() == old(self).remaining() - values@.len() * size_of::<T>(),
+            old(self).aligned() && r == Err(AllocErr::Exhausted)
+                ==> values@.len() * size_of::<T>() > old(self).remaining(),
     {
         proof { use_type_invariant(&*self); }
         let inner = self.inner.take();
@@ -911,7 +1044,7 @@ impl<T: Copy> SliceArena<T> {
                 self.inner = Some(inner);
                 result
             },
-            None => Err(AllocErr),
+            None => Err(AllocErr::Global),
         }
     }
 

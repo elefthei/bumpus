@@ -1,6 +1,6 @@
 # bumpus
 
-A verified, fixed single-chunk bump allocator. `src/lib.rs` contains allocation and reclamation proofs; `src/layout.rs` is the trusted `Layout` bridge.
+A verified, fixed single-chunk bump allocator. `src/lib.rs` contains allocation and reclamation proofs; `src/layout.rs` is the trusted `Layout::size`/`Layout::align` bridge.
 
 ## Specification
 
@@ -24,10 +24,11 @@ Free bytes and outstanding allocation ranges form a disjoint partition of the ch
 
 ### Creation and allocation
 
-- `try_with_capacity(cap)` creates an empty arena with `capacity = remaining = cap` and `cursor = end`. It returns `AllocErr` for zero/oversized capacity (`cap > MAX_CAP`) or an unrepresentable end address. Global-allocator failure returns `AllocErr`; the arena never grows.
-- For `try_alloc_layout(layout)`, let `c` be the old cursor, `s = layout.size()`, `a = layout.align()`, and `p = align_down(c - s, a)`. Allocation succeeds **if and only if** `s <= c - start` and `start <= p`.
+- `AllocErr` names why a request was refused: `Capacity` (`cap == 0 || cap > MAX_CAP`), `Global` (global-allocator failure, an unrepresentable chunk end, or a container's pointer table), `Exhausted` (does not fit in this chunk, including a slice byte count that overflows `usize`).
+- `try_with_capacity(cap)` creates an empty arena with `capacity = remaining = cap`, `cursor = end`, and `start` a multiple of `CHUNK_ALIGN` (16). Invalid capacities return exactly `Capacity`; the arena never grows.
+- For `try_alloc(s, a)` with `a` a power of two, let `c` be the old cursor and `p = align_down(c - s, a)`. Allocation succeeds **if and only if** `s <= c - start` and `start <= p`. `try_alloc_layout(layout)` is `try_alloc(layout.size(), layout.align())`.
 - Success returns a pointer at exactly `p`, sets `cursor = p`, and adds one fresh outstanding allocation. The pointer is aligned to `a`, its byte range `[p, p + s)` lies inside the arena, and the caller receives its uninitialized-memory permission (`PointsToRaw`) and return token (`BumpTok`). Alignment padding stays owned by the arena.
-- `AllocErr` leaves the entire tracked state unchanged. In particular, `s + a - 1 <= remaining` is sufficient for success.
+- Failure is exactly `Exhausted` and leaves the entire tracked state unchanged. In particular, `s + a - 1 <= remaining` is sufficient for success.
 
 ### Permissions and reclamation
 
@@ -43,9 +44,22 @@ Reclamation does not run allocation destructors. There is no `Drop` implementati
 
 `TypedArena<T>` stores initialized `T: Copy` values by index; `SliceArena<T>` stores immutable copied slices by index. Both encapsulate tracked permissions and allocation tokens behind type invariants, expose fallible `with_capacity`/`try_push` plus `len`/`get`, and require explicit `free`. Freeing runs no destructors (`T: Copy`). The crate supports `no_std` with `alloc` on 32-bit and 64-bit targets.
 
+Both containers expose `capacity()`, `remaining()`, and `aligned()` (the cursor is a multiple of `align_of::<T>()`) to proofs:
+
+- `with_capacity(c)` yields `capacity() == remaining() == c`, and `aligned()` whenever `align_of::<T>() <= CHUNK_ALIGN` and `c % align_of::<T>() == 0`. Invalid capacities return exactly `Capacity`.
+- `try_push` never changes `capacity()`. Any error leaves the contents, `remaining()`, and `aligned()` unchanged.
+- From an aligned cursor, a successful push keeps the cursor aligned and consumes exactly `w` bytes (`w = size_of::<T>()` for a value, `w = len * size_of::<T>()` for a slice), and `Exhausted` is returned only when `w > remaining()`. Same-type pushes therefore never pad, and a chunk of `n * size_of::<T>()` bytes holds `n` values.
+
 ### Verification boundary
 
-Tracked permissions and tokens are proof resources, not runtime ownership checks. Memory-safety guarantees require verified callers to satisfy the contracts; ordinary Rust raw-pointer dereferences still require `unsafe`. The crate-local trusted boundaries are the `core::alloc::Layout` bridge in `src/layout.rs`, fallible chunk allocation in `try_allocate`, and shared slice formation in `slice_ref`.
+Tracked permissions and tokens are proof resources, not runtime ownership checks. Memory-safety guarantees require verified callers to satisfy the contracts; ordinary Rust raw-pointer dereferences still require `unsafe`. The crate-local trusted statements are:
+
+- `try_allocate` (`src/lib.rs`): an external body that calls the global allocator and fabricates its `PointsToRaw`/`Dealloc` permissions with `Tracked::assume_new()`, mirroring vstd's `allocate` contract. A failed allocation is unconstrained.
+- `slice_ref` (`src/arena.rs`): an external body that forms a shared slice from a `SlicePerm` (non-null, aligned base; initialized, contiguous, single-provenance elements; at most `isize::MAX` bytes).
+- `Layout::size`/`Layout::align` (`src/layout.rs`): `assume_specification`s stating that `align` is a power of two that fits in `usize`. No `global layout` directive is declared, so no pointer-width or primitive-alignment axiom is assumed.
+- vstd's raw-pointer, layout, ghost-map, and `PCell` axioms.
+
+Tracked values are affine: Verus does not report an arena that is dropped without `free`, and a panic between a container's `inner.take()` and its restoration leaks the chunk. Leak freedom and behavior under unwinding are therefore not verified. Proofs were checked on x86_64; the contracts contain no target-specific constants.
 
 `smoke` proves pointer reuse after partial and full reset and reads `42` from an allocation retained across the partial rewind.
 
