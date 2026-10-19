@@ -2,10 +2,51 @@
 
 A verified, fixed single-chunk bump allocator. `src/lib.rs` contains allocation and reclamation proofs; `src/layout.rs` is the trusted `Layout` bridge.
 
-`Bump::{start, end, cursor}` exposes the verified arena bounds and cursor. `try_alloc_layout` specifies the exact aligned address and succeeds exactly when the requested size and alignment fit; failure leaves tracked state unchanged.
+## Specification
 
-`BumpTok::{inst, id, alloc}` identifies an allocation; `alloc()` returns `Alloc { addr, size }`. `BumpTok::agree` relates a live token to `BumpState::addr_of`. Return a subset of permissions and tokens to `reset_to(mark, ...)`; unreturned allocations must start at or above `mark` and remain valid. `reset` returns every allocation and rewinds to `end`; `free` returns every allocation and deallocates the chunk. Neither runs allocation destructors. There is no `Drop`: omitting `free` leaks the chunk.
+The contracts below apply to verified callers holding a well-formed `BumpState`. Allocation and reset preserve the arena's identity and pointer provenance.
 
-`smoke` proves pointer reuse after both partial and full reset and reads a value written before the partial rewind.
+### Arena model
+
+One fixed chunk occupies the half-open byte range `[start, end)`. Allocation proceeds downward from `cursor`:
+
+```text
+start <= cursor <= end
+capacity = end - start
+remaining = cursor - start
+in_arena(addr, size) = start <= addr && addr + size <= end
+align_down(x, a) = x - x % a
+```
+
+These are mathematical integer expressions, not wrapping machine arithmetic. `Bump::{start, end, cursor, capacity, remaining, in_arena}` exposes this model to proofs. `remaining` is the space below the cursor, not the total number of free bytes.
+
+Free bytes and outstanding allocation ranges form a disjoint partition of the chunk. Distinct outstanding allocations have disjoint byte ranges, and every byte in `[start, cursor)` is free. Zero-sized allocations may share an address.
+
+### Creation and allocation
+
+- `try_with_capacity(cap)` creates an empty arena with `capacity = remaining = cap` and `cursor = end`. It returns `AllocErr` for zero/oversized capacity (`cap > MAX_CAP`) or an unrepresentable end address. Failure of the global allocator aborts; the arena never grows.
+- For `try_alloc_layout(layout)`, let `c` be the old cursor, `s = layout.size()`, `a = layout.align()`, and `p = align_down(c - s, a)`. Allocation succeeds **if and only if** `s <= c - start` and `start <= p`.
+- Success returns a pointer at exactly `p`, sets `cursor = p`, and adds one fresh outstanding allocation. The pointer is aligned to `a`, its byte range `[p, p + s)` lies inside the arena, and the caller receives its uninitialized-memory permission (`PointsToRaw`) and return token (`BumpTok`). Alignment padding stays owned by the arena.
+- `AllocErr` leaves the entire tracked state unchanged. In particular, `s + a - 1 <= remaining` is sufficient for success.
+
+### Permissions and reclamation
+
+`BumpTok::{inst, id, alloc}` identifies an allocation and its `Alloc { addr, size }` record. `BumpState::outstanding()` is the set of live allocation IDs. Given a token from the same arena instance, `BumpTok::agree` proves its ID is outstanding and `BumpState::addr_of(id) == token.alloc().addr`.
+
+Every entry in a return map `back` must contain that allocation's token and complete raw-memory permission, with the arena's provenance (`back_wf`). The map may contain only outstanding IDs.
+
+- `reset_to(mark, back)` requires `start <= mark <= end` and every unreturned allocation's starting address to be at least `mark`. It consumes the returned permissions and tokens, sets `cursor = mark`, and removes exactly `back.dom()` from the outstanding IDs. Unreturned allocations and their permissions remain valid; their stored values are preserved. The mark need not be a previously saved cursor.
+- `reset(back)` requires **every** outstanding permission and token. It is `reset_to(end, back)`: no outstanding allocations remain and `remaining = capacity`. The same layout allocated from the initial cursor and immediately after a full reset yields the same address.
+- `free(back)` likewise requires every outstanding permission and token, consumes the arena and tracked state, and releases the chunk to the global allocator.
+
+Reclamation does not run allocation destructors. There is no `Drop` implementation: omitting `free` leaks the chunk. Permissions must be returned explicitly; reset cannot invalidate an owner whose permission is still held by a caller.
+
+### Verification boundary
+
+Tracked permissions and tokens are proof resources, not runtime ownership checks. Memory-safety guarantees require verified callers to satisfy the contracts; ordinary Rust raw-pointer dereferences still require `unsafe`. The only crate-local trusted specifications are the `core::alloc::Layout` bridge in `src/layout.rs`.
+
+`smoke` proves pointer reuse after partial and full reset and reads `42` from an allocation retained across the partial rewind.
+
+## Verification
 
 Checks: `cargo verus verify`, `cargo test --release`, `cargo build --release --all-targets`, and `cargo bench --bench bump`.
