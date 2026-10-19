@@ -1,4 +1,6 @@
 #![cfg_attr(not(verus_only), allow(dead_code, unused_braces))]
+#![no_std]
+#![cfg_attr(verus_keep_ghost, feature(allocator_api))]
 //! A verified, fixed single-chunk bump allocator.
 //!
 //! Allocations never grow the arena. Call `Bump::free` with every outstanding
@@ -6,8 +8,10 @@
 //! dropping an arena without explicitly freeing it leaks the chunk.
 //!
 //! Memory-safety guarantees require verified callers to preserve tracked permissions;
-//! ordinary Rust raw-pointer dereferences still require `unsafe`. The only crate-local
-//! trusted specifications are the `core::alloc::Layout` bridge in [`layout`].
+//! ordinary Rust raw-pointer dereferences still require `unsafe`. Trusted boundaries
+//! are the `core::alloc::Layout` bridge, fallible chunk allocation, and slice formation.
+
+extern crate alloc;
 
 use core::alloc::Layout;
 #[cfg(verus_only)]
@@ -15,25 +19,47 @@ use vstd::arithmetic::power2::{is_pow2, pow2};
 use vstd::cell::pcell::{PCell, PointsTo as CellPointsTo};
 use vstd::prelude::*;
 use vstd::raw_ptr::{
-    allocate, deallocate, expose_provenance, with_exposed_provenance, Dealloc, IsExposed,
-    PointsToRaw,
+    deallocate, expose_provenance, with_exposed_provenance, Dealloc, IsExposed, PointsToRaw,
 };
 use vstd::resource::map::{GhostMapAuth, GhostPointsTo};
 #[cfg(verus_only)]
 use vstd::resource::Loc;
 
+pub mod arena;
 pub mod layout;
+pub use arena::{SliceArena, SlicePerm, TypedArena};
 
 verus! {
-
-global size_of usize == 8;
 global layout u64 is size == 8, align == 8;
+
 
 pub const CHUNK_ALIGN: usize = 16;
 pub const MAX_CAP: usize = (isize::MAX as usize) - 15;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocErr;
+
+/// Trusted: fallible global allocation. A null result becomes `None`; no abort.
+#[verifier::external_body]
+fn try_allocate(size: usize, align: usize)
+    -> (r: Option<(*mut u8, Tracked<PointsToRaw>, Tracked<Dealloc>)>)
+    requires vstd::layout::valid_layout(size, align), size != 0,
+    ensures r matches Some(pt) ==> {
+        &&& pt.1@.is_range(pt.0.addr() as int, size as int)
+        &&& pt.0.addr() != 0
+        &&& pt.0.addr() + size <= usize::MAX + 1
+        &&& pt.2@@ == (vstd::raw_ptr::DeallocData { addr: pt.0.addr(), size: size as nat, align: align as nat, provenance: pt.1@.provenance() })
+        &&& pt.0.addr() as int % align as int == 0
+        &&& pt.0@.provenance == pt.1@.provenance()
+    },
+    opens_invariants none
+{
+    // SAFETY: valid_layout and size != 0 are preconditions.
+    let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
+    // SAFETY: layout is valid and nonzero; null is handled below.
+    let p = unsafe { alloc::alloc::alloc(layout) };
+    if p.is_null() { None } else { Some((p, Tracked::assume_new(), Tracked::assume_new())) }
+}
 
 /// A mathematical allocation index; its nat identity is part of the ghost API.
 pub type Id = nat;
@@ -101,6 +127,7 @@ impl Bump {
     }
     pub closed spec fn wf(self, st: BumpState) -> bool {
         &&& st.ptr_perm.id() == self.ptr.id()
+        &&& self.start != 0
         &&& self.start <= *st.ptr_perm.value() <= self.end
         &&& st.exposed.provenance() == st.free.provenance()
         &&& st.dealloc.provenance() == st.free.provenance()
@@ -114,7 +141,7 @@ impl Bump {
             ==> range_of(st.auth@[k]).disjoint(used_upto(st.auth@, k))
     }
 
-    /// Creates one fixed-size chunk; allocation failure in the global allocator aborts.
+    /// Creates one fixed-size chunk, returning `AllocErr` on global allocation failure.
     ///
     /// # Errors
     /// Returns `AllocErr` for zero/oversized capacity or an unrepresentable end address.
@@ -122,19 +149,19 @@ impl Bump {
         ensures
             r matches Ok((b, st)) ==> b.wf(st@) && st@.outstanding().is_empty()
                 && b.capacity() == cap && b.remaining(st@) == cap,
-            0 < cap <= MAX_CAP && cap % CHUNK_ALIGN != 0 ==> r is Ok,
     {
         if cap == 0 || cap > MAX_CAP { return Err(AllocErr); }
         proof {
             reveal(is_pow2);
             assert(is_pow2(16)) by (compute);
         }
-        let (base, Tracked(free), Tracked(dealloc)) = allocate(cap, CHUNK_ALIGN);
+        let Some((base, Tracked(free), Tracked(dealloc))) = try_allocate(cap, CHUNK_ALIGN)
+            else { return Err(AllocErr); };
         let start = base.addr();
         if start > usize::MAX - cap {
             proof {
                 vstd::arithmetic::div_mod::lemma_mod_adds(start as int, cap as int, 16);
-                assert((usize::MAX as int + 1) % 16 == 0) by (compute);
+                assert((usize::MAX as int + 1) % 16 == 0);
             }
             deallocate(base, cap, CHUNK_ALIGN, Tracked(free), Tracked(dealloc));
             return Err(AllocErr);
@@ -166,6 +193,7 @@ impl Bump {
             final(st).provenance() == old(st).provenance(),
             self.remaining(*final(st)) <= self.remaining(*old(st)),
             r matches Ok((p, perm, tok)) ==> {
+                &&& p.addr() != 0
                 &&& perm@.is_range(p.addr() as int, layout.size() as int)
                 &&& perm@.provenance() == p@.provenance
                 &&& perm@.provenance() == final(st).provenance()
@@ -510,15 +538,10 @@ impl Bump {
 }
 
 /// Preserves a u64 across a partial rewind and proves partial/full address reuse.
-pub fn smoke() -> (r: u64)
-    ensures r == 42,
+pub fn smoke() -> (r: Result<u64, AllocErr>)
+    ensures r matches Ok(v) ==> v == 42,
 {
-    let (bump, Tracked(mut st)) = match Bump::try_with_capacity(4096) {
-        Ok(pair) => pair,
-        // The raw allocation spec permits an end at usize::MAX + 1. An odd
-        // capacity cannot reach that boundary from a 16-byte-aligned base.
-        Err(_) => Bump::try_with_capacity(4095).unwrap(),
-    };
+    let (bump, Tracked(mut st)) = Bump::try_with_capacity(4096)?;
     let mut bump = bump;
     let layout = Layout::new::<u64>();
     let (a, Tracked(pa), Tracked(ta)) =
@@ -552,7 +575,7 @@ pub fn smoke() -> (r: u64)
     let tracked mut back_d = Map::tracked_empty();
     proof { back_d.tracked_insert(td.id(), (pd, td)); }
     bump.free(Tracked(st), Tracked(back_d));
-    v
+    Ok(v)
 }
 
 }

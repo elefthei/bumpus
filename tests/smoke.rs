@@ -4,7 +4,7 @@ use vstd::prelude::Tracked;
 
 #[test]
 fn verified_smoke() {
-    assert_eq!(verus_bumpalo::smoke(), 42);
+    assert_eq!(verus_bumpalo::smoke(), Ok(42));
 }
 
 #[test]
@@ -50,12 +50,8 @@ fn runtime_behaviour() {
 
     bump.reset(Tracked::assume_new(), Tracked::assume_new());
     let zero = Layout::from_size_align(0, 64).unwrap();
-    let (z1, _, _) = bump
-        .try_alloc_layout(zero, Tracked::assume_new())
-        .unwrap();
-    let (z2, _, _) = bump
-        .try_alloc_layout(zero, Tracked::assume_new())
-        .unwrap();
+    let (z1, _, _) = bump.try_alloc_layout(zero, Tracked::assume_new()).unwrap();
+    let (z2, _, _) = bump.try_alloc_layout(zero, Tracked::assume_new()).unwrap();
     assert_eq!(z1 as usize % 64, 0);
     assert_eq!(z1, z2);
 

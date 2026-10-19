@@ -2,9 +2,10 @@
 name = "verus-bumpalo"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
-vstd = "=0.0.0-2026-10-04-0306"
+vstd = { version = "=0.0.0-2026-09-06-0133", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 criterion = "0.8"
@@ -19,4 +20,4 @@ harness = false
 verify = true
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)', 'cfg(verus_keep_ghost)'] }

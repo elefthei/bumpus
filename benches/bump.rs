@@ -53,12 +53,14 @@ fn run<T, const OPAQUE: bool>(c: &mut Criterion, name: &str) {
 
 /// Prints verus-bumpalo / bumpalo time ratios from Criterion's saved estimates.
 fn report() {
-    let home = std::env::var_os("CRITERION_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("target"))
-            .join("criterion")
-    });
+    let home = std::env::var_os("CRITERION_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("CARGO_TARGET_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("target"))
+                .join("criterion")
+        });
     let estimate = |group: &str, function: &str, key: &str| -> Option<f64> {
         let path = home
             .join(group.replace('/', "_"))
@@ -67,9 +69,15 @@ fn report() {
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
         v[key]["point_estimate"].as_f64()
     };
-    println!("\n{:<24} {:>8} {:>8}   verus-bumpalo / bumpalo time", "group", "slope", "median");
+    println!(
+        "\n{:<24} {:>8} {:>8}   verus-bumpalo / bumpalo time",
+        "group", "slope", "median"
+    );
     for group in GROUPS {
-        let ratio = |key: &str| match (estimate(group, "verus-bumpalo", key), estimate(group, "bumpalo", key)) {
+        let ratio = |key: &str| match (
+            estimate(group, "verus-bumpalo", key),
+            estimate(group, "bumpalo", key),
+        ) {
             (Some(v), Some(b)) => format!("{:.2}x", v / b),
             _ => "n/a".to_string(),
         };
