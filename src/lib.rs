@@ -15,9 +15,9 @@ extern crate alloc;
 
 use core::alloc::Layout;
 #[cfg(verus_only)]
-use vstd::arithmetic::power2::{is_pow2, pow2};
-#[cfg(verus_only)]
 use vstd::arithmetic::power::pow;
+#[cfg(verus_only)]
+use vstd::arithmetic::power2::{is_pow2, pow2};
 use vstd::cell::pcell::{PCell, PointsTo as CellPointsTo};
 use vstd::prelude::*;
 use vstd::raw_ptr::{
