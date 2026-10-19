@@ -45,10 +45,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
-name = "bumpalo"
-version = "3.21.0"
-
-[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -556,8 +552,9 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 name = "verus-bumpalo"
 version = "0.1.0"
 dependencies = [
- "bumpalo 3.21.0",
+ "bumpalo",
  "criterion",
+ "serde_json",
  "vstd",
 ]
 
@@ -665,7 +662,7 @@ version = "0.2.129"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f501a8bc3719dba86ef8ae4728879c08001bea749eb1333ac5b91e040e2a6b7"
 dependencies = [
- "bumpalo 3.20.3",
+ "bumpalo",
  "proc-macro2",
  "quote",
  "syn 3.0.9",

@@ -50,3 +50,24 @@ Tracked permissions and tokens are proof resources, not runtime ownership checks
 ## Verification
 
 Checks: `cargo verus verify`, `cargo test --release`, `cargo build --release --all-targets`, and `cargo bench --bench bump`.
+
+## Benchmark
+
+Run `cargo bench --bench bump` to compare against crates.io `bumpalo = 3.20.3`, using 200 samples and a 10-second measurement window per function. Each timed iteration performs 10,000 allocations followed by an arena reset; arena construction is outside the timed loop. `small` allocates `u8`; `big` allocates `[usize; 32]`.
+
+The `/const` variants expose the layout to the optimizer so both allocators can fold layout-dependent branches. The `/opaque` variants hide the layout with `black_box` on every allocation.
+
+One local release-mode run on Linux x86_64 (WSL2) produced:
+
+| Group | Slope ratio | Median ratio |
+| --- | ---: | ---: |
+| small/const | 0.62× | 0.62× |
+| small/opaque | 0.47× | 0.47× |
+| big/const | 0.39× | 0.38× |
+| big/opaque | 0.43× | 0.43× |
+
+Each ratio is **verus-bumpalo time / bumpalo time**, not a throughput ratio: below 1 means verus-bumpalo took less time. For example, 0.62× means 62% of bumpalo's time, or 38% less time. Slope uses Criterion's linear-regression time-per-iteration estimate; median uses the median per-iteration time across samples. These are measurements from one run, not a machine-independent speedup guarantee.
+
+The acceptance threshold is ≤1.30× for both `/const` slope ratios (median if slope is unavailable); both rows passed in this run.
+
+Estimates are read from `$CRITERION_HOME`, else `$CARGO_TARGET_DIR/criterion`, else `target/criterion`. Missing or invalid estimates print `n/a`; filtered runs can display stale rows for groups that were not run.
