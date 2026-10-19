@@ -1,0 +1,21 @@
+[package]
+name = "verus-bumpalo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vstd = "=0.0.0-2026-10-04-0306"
+
+[dev-dependencies]
+criterion = "0.8"
+bumpalo = { path = "/home/eioannidis/git/bumpalo" }
+
+[[bench]]
+name = "bump"
+harness = false
+
+[package.metadata.verus]
+verify = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(verus_only)'] }
