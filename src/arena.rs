@@ -599,6 +599,16 @@ pub struct SliceArena<T: Copy> {
     inner: Option<SliceInner<T>>,
 }
 
+// SAFETY: the arena exclusively owns its chunk and copied elements. All mutation
+// and reclamation require ownership or &mut self; moving T requires T: Send.
+#[verifier::external]
+unsafe impl<T: Copy + Send> Send for SliceArena<T> {}
+
+// SAFETY: shared access only reads initialized elements and pointer metadata;
+// returned slices borrow the arena, so sharing them requires T: Sync.
+#[verifier::external]
+unsafe impl<T: Copy + Sync> Sync for SliceArena<T> {}
+
 impl<T: Copy> SliceInner<T> {
     closed spec fn wf(&self) -> bool {
         &&& self.bump.wf(self.st@)

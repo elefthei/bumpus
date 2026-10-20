@@ -10,6 +10,8 @@
 //! Memory-safety guarantees require verified callers to preserve tracked permissions;
 //! ordinary Rust raw-pointer dereferences still require `unsafe`. Trusted boundaries
 //! are `Layout::size`/`Layout::align`, fallible chunk allocation, and slice formation.
+//! SliceArena's native Send/Sync implementations additionally rely on exclusive
+//! chunk ownership, immutable shared access, and the corresponding T: Send/Sync bound.
 
 extern crate alloc;
 
