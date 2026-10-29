@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-vstd = { version = "=0.0.0-2026-09-06-0133", default-features = false, features = ["alloc"] }
+vstd = { version = "=0.0.0-2026-10-04-0306", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 criterion = "0.8"
