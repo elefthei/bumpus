@@ -1,4 +1,4 @@
-use verus_bumpalo::{AllocErr, SliceArena, TypedArena};
+use bumpus::{AllocErr, SliceArena, TypedArena};
 
 #[test]
 fn arena_round_trips() {

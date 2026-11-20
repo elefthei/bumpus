@@ -1,10 +1,10 @@
 use core::alloc::Layout;
-use verus_bumpalo::Bump;
+use bumpus::Bump;
 use vstd::prelude::Tracked;
 
 #[test]
 fn verified_smoke() {
-    assert_eq!(verus_bumpalo::smoke(), Ok(42));
+    assert_eq!(bumpus::smoke(), Ok(42));
 }
 
 #[test]

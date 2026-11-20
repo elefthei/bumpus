@@ -3,7 +3,7 @@ use criterion::{Criterion, Throughput};
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
-use verus_bumpalo::Bump;
+use bumpus::Bump;
 use vstd::prelude::Tracked;
 
 const N: usize = 10_000;
@@ -25,7 +25,7 @@ fn run<T, const OPAQUE: bool>(c: &mut Criterion, name: &str) {
     group.sample_size(200);
     group.measurement_time(Duration::from_secs(10));
 
-    group.bench_function("verus-bumpalo", |b| {
+    group.bench_function("bumpus", |b| {
         let (mut arena, _st) = Bump::try_with_capacity(cap).unwrap();
         b.iter(|| {
             for _ in 0..N {
@@ -51,7 +51,7 @@ fn run<T, const OPAQUE: bool>(c: &mut Criterion, name: &str) {
     group.finish();
 }
 
-/// Prints verus-bumpalo / bumpalo time ratios from Criterion's saved estimates.
+/// Prints bumpus / bumpalo time ratios from Criterion's saved estimates.
 fn report() {
     let home = std::env::var_os("CRITERION_HOME")
         .map(PathBuf::from)
@@ -70,12 +70,12 @@ fn report() {
         v[key]["point_estimate"].as_f64()
     };
     println!(
-        "\n{:<24} {:>8} {:>8}   verus-bumpalo / bumpalo time",
+        "\n{:<24} {:>8} {:>8}   bumpus / bumpalo time",
         "group", "slope", "median"
     );
     for group in GROUPS {
         let ratio = |key: &str| match (
-            estimate(group, "verus-bumpalo", key),
+            estimate(group, "bumpus", key),
             estimate(group, "bumpalo", key),
         ) {
             (Some(v), Some(b)) => format!("{:.2}x", v / b),

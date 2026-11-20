@@ -82,7 +82,7 @@ One local release-mode run on Linux x86_64 (WSL2) produced:
 | big/const | 0.39× | 0.38× |
 | big/opaque | 0.43× | 0.43× |
 
-Each ratio is **verus-bumpalo time / bumpalo time**, not a throughput ratio: below 1 means verus-bumpalo took less time. For example, 0.62× means 62% of bumpalo's time, or 38% less time. Slope uses Criterion's linear-regression time-per-iteration estimate; median uses the median per-iteration time across samples. These are measurements from one run, not a machine-independent speedup guarantee.
+Each ratio is **bumpus time / bumpalo time**, not a throughput ratio: below 1 means bumpus took less time. For example, 0.62× means 62% of bumpalo's time, or 38% less time. Slope uses Criterion's linear-regression time-per-iteration estimate; median uses the median per-iteration time across samples. These are measurements from one run, not a machine-independent speedup guarantee.
 
 The acceptance threshold is ≤1.30× for both `/const` slope ratios (median if slope is unavailable); both rows passed in this run.
 
